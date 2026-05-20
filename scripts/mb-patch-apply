@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""
+Applies Matterbridge Talk bridge customizations to MatterbridgeManager.php.
+Safe to run repeatedly — checks before applying each patch.
+Exits non-zero if any patch fails to apply.
+"""
+
+import sys
+import shutil
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+TARGET = Path("/home/nextcloud/apps/spreed/lib/MatterbridgeManager.php")
+BACKUP_DIR = Path("/etc/nextcloud-patches/backups")
+
+results = []
+
+def fail(msg):  results.append(("FAIL", msg))
+def ok(msg):    results.append(("OK",   msg))
+def skip(msg):  results.append(("SKIP", msg))
+
+
+def apply():
+    if not TARGET.exists():
+        fail("MatterbridgeManager.php not found")
+        return
+
+    content = TARGET.read_text()
+
+    # ------------------------------------------------------------------
+    # Patch 1 — [general] media block inserted before foreach loop
+    # ------------------------------------------------------------------
+    P1_CHECK  = '\tMediaDownloadPath = "/var/matterbridge-media"'
+    P1_ANCHOR = "\t\tforeach ($bridge['parts'] as $k => $part) {"
+
+    P1_INSERT = (
+        '\t\t$content = \'[general]\' . "\\n";\n'
+        '\t\t$content .= \'\tMediaDownloadPath = "/var/matterbridge-media"\' . "\\n";\n'
+        '\t\t$content .= \'\tMediaServerDownload = "https://next.minitrash.com/matterbridge-media"\' . "\\n";\n'
+        '\t\t$content .= \'\tMediaDownloadSize = 52428800\' . "\\n\\n"; // 50 MB\n'
+        "\t\tforeach ($bridge['parts'] as $k => $part) {"
+    )
+
+    if P1_CHECK in content:
+        skip("Patch 1 (general block): already applied")
+    elif P1_ANCHOR in content:
+        content = content.replace(P1_ANCHOR, P1_INSERT, 1)
+        ok("Patch 1 (general block): applied")
+    else:
+        fail("Patch 1 (general block): anchor not found — manual review needed")
+
+    # ------------------------------------------------------------------
+    # Patch 2 — Telegram section: UseFirstName + clean RemoteNickFormat
+    # ------------------------------------------------------------------
+    P2_CHECK = '\tUseFirstName = true'
+
+    # Original telegram block ends with default RemoteNickFormat + steam elseif
+    P2_ORIG = (
+        '\t\t\t\t$content .= \'\tPrefixMessagesWithNick = true\' . "\\n";\n'
+        '\t\t\t\t$content .= \'\tRemoteNickFormat = "[{PROTOCOL}] <{NICK}> "\' . "\\n\\n";\n'
+        "\t\t\t} elseif ($type === 'steam') {"
+    )
+    P2_PATCH = (
+        '\t\t\t\t$content .= \'\tPrefixMessagesWithNick = true\' . "\\n";\n'
+        '\t\t\t\t$content .= \'\tRemoteNickFormat = "{NICK}: "\' . "\\n";\n'
+        '\t\t\t\t$content .= \'\tUseFirstName = true\' . "\\n";\n'
+        '\t\t\t\t$content .= \'\tMediaConvertWebPToPNG = true\' . "\\n\\n";\n'
+        "\t\t\t} elseif ($type === 'steam') {"
+    )
+
+    if P2_CHECK in content:
+        skip("Patch 2 (telegram block): already applied")
+    elif P2_ORIG in content:
+        content = content.replace(P2_ORIG, P2_PATCH, 1)
+        ok("Patch 2 (telegram block): applied")
+    else:
+        fail("Patch 2 (telegram block): anchor not found — manual review needed")
+
+    # ------------------------------------------------------------------
+    # Patch 3 — nctalk section: nick format + MediaDownloads
+    # ------------------------------------------------------------------
+    P3_CHECK  = '\tMediaDownloads = ["telegram"]'
+
+    # Anchor: the Password line is unique to the nctalk section
+    P3_ORIG = (
+        '\t\t\t\t$content .= sprintf(\'\tPassword = "%s"\', $part[\'password\']) . "\\n";\n'
+        '\t\t\t\t$content .= \'\tPrefixMessagesWithNick = true\' . "\\n";\n'
+        '\t\t\t\t$content .= \'\tRemoteNickFormat = "[{PROTOCOL}] <{NICK}> "\' . "\\n\\n";\n'
+    )
+    P3_PATCH = (
+        '\t\t\t\t$content .= sprintf(\'\tPassword = "%s"\', $part[\'password\']) . "\\n";\n'
+        '\t\t\t\t$content .= \'\tPrefixMessagesWithNick = false\' . "\\n";\n'
+        '\t\t\t\t$content .= \'\tRemoteNickFormat="{NICK}"\' . "\\n";\n'
+        '\t\t\t\t$content .= \'\tMediaDownloads = ["telegram"]\' . "\\n\\n";\n'
+    )
+
+    if P3_CHECK in content:
+        skip("Patch 3 (nctalk block): already applied")
+    elif P3_ORIG in content:
+        content = content.replace(P3_ORIG, P3_PATCH, 1)
+        ok("Patch 3 (nctalk block): applied")
+    else:
+        fail("Patch 3 (nctalk block): anchor not found — manual review needed")
+
+    # ------------------------------------------------------------------
+    # Write file only if patches were applied
+    # ------------------------------------------------------------------
+    applied = [r for r in results if r[0] == "OK"]
+    if applied:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(TARGET, BACKUP_DIR / f"MatterbridgeManager.php.{ts}")
+        TARGET.write_text(content)
+        subprocess.run(["chown", "www-data:www-data", str(TARGET)], check=False)
+
+
+apply()
+
+for status, msg in results:
+    icon = "✓" if status == "OK" else ("✗" if status == "FAIL" else "–")
+    print(f"  {icon} {msg}")
+
+sys.exit(1 if any(r[0] == "FAIL" for r in results) else 0)

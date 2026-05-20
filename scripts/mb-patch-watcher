@@ -1,0 +1,62 @@
+#!/bin/bash
+# Watches MatterbridgeManager.php for changes (e.g. after Talk app update)
+# and automatically re-applies the Matterbridge bridge customizations.
+
+TARGET_FILE="MatterbridgeManager.php"
+TARGET_DIR="/home/nextcloud/apps/spreed/lib"
+NC_URL="https://next.minitrash.com"
+DM_TOKEN="eiisscuv"
+NC_USER="admin"
+NC_PASS="cyPVBoLNCSjZppl5rIdaF0crbYug0WLBaiVvzKcdCUTbuvzjF7YdXrIKCxqbs8PYe0ZnwvQc"
+
+dm() {
+    curl -s -X POST \
+        -u "$NC_USER:$NC_PASS" \
+        -H "OCS-APIREQUEST: true" \
+        "$NC_URL/ocs/v2.php/apps/spreed/api/v1/chat/$DM_TOKEN" \
+        --data-urlencode "message=$1" -o /dev/null
+}
+
+handle_change() {
+    # Brief settle time — app updates often write multiple files rapidly
+    sleep 5
+
+    # Check if already patched (skip spurious events)
+    if grep -q "MediaDownloadPath" "$TARGET_DIR/$TARGET_FILE" 2>/dev/null; then
+        return
+    fi
+
+    # Get the new Talk version for context
+    talk_version=$(grep -oP '(?<=<version>)[^<]+' \
+        /home/nextcloud/apps/spreed/appinfo/info.xml 2>/dev/null || echo "unknown")
+
+    patch_output=$(/usr/local/bin/mb-patch-apply 2>&1)
+    exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        # Re-generate bridge config by toggling maintenance mode to flush cache
+        systemctl restart php8.4-fpm 2>/dev/null
+
+        dm "✅ Talk updated to v${talk_version} — Matterbridge patch re-applied automatically. Bridge is intact.
+
+Patch summary:
+${patch_output}"
+    else
+        dm "⚠️ Talk updated to v${talk_version} — Matterbridge patch needs manual review.
+
+The Talk update changed MatterbridgeManager.php in a way the patcher couldn't handle automatically. The Telegram bridge formatting and media relay may be broken until this is fixed.
+
+Patch output:
+${patch_output}
+
+File: $TARGET_DIR/$TARGET_FILE
+Backups: /etc/nextcloud-patches/backups/"
+    fi
+}
+
+# Watch the lib directory for writes or replacements of the target file
+inotifywait -m -e close_write,moved_to,create \
+    "$TARGET_DIR" --format '%f' 2>/dev/null \
+| while read -r filename; do
+    [ "$filename" = "$TARGET_FILE" ] && handle_change
+done

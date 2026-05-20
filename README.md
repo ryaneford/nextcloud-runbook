@@ -453,6 +453,24 @@ $content .= '	RemoteNickFormat="{NICK}"' . "\n";
 $content .= '	MediaDownloads = ["telegram"]' . "\n\n";
 ```
 
+After patching, restart PHP-FPM and re-PUT the bridge via the Talk API to regenerate the TOML.
+
+### Auto-patch watcher
+
+The patch is overwritten every time the Talk app updates. A watcher service detects the change and re-applies automatically, then DMs the admin account with the result.
+
+```bash
+mkdir -p /etc/nextcloud-patches/backups
+cp scripts/mb-patch-apply /usr/local/bin/mb-patch-apply
+cp scripts/mb-patch-watcher /usr/local/bin/mb-patch-watcher
+cp systemd/mb-patch-watcher.service /etc/systemd/system/mb-patch-watcher.service
+chmod +x /usr/local/bin/mb-patch-apply /usr/local/bin/mb-patch-watcher
+systemctl daemon-reload
+systemctl enable --now mb-patch-watcher
+```
+
+Update `DM_TOKEN`, `NC_URL`, `NC_USER`, and `NC_PASS` in `mb-patch-watcher` before deploying. The watcher sends success/failure notifications to the DM token so you always know whether the bridge survived the update.
+
 After patching, restart PHP-FPM and re-PUT the bridge via the Talk API to regenerate the TOML:
 
 ```bash

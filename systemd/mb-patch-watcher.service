@@ -1,0 +1,12 @@
+[Unit]
+Description=Matterbridge patch watcher — re-patches MatterbridgeManager.php after Talk updates
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mb-patch-watcher
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
