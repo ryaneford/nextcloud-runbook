@@ -1,0 +1,119 @@
+#!/bin/bash
+# Watches /var/matterbridge-media for files Matterbridge downloads from Telegram.
+# Uploads each file to bridge-bot's Nextcloud storage via WebDAV and shares it
+# natively in the Talk room so it renders as an inline image attachment.
+
+MEDIA_DIR=/var/matterbridge-media
+BRIDGE_USER="bridge-bot"
+TOML="/tmp/bridge-h8frj3zy.toml"
+NC_URL="https://next.minitrash.com"
+TALK_TOKEN="h8frj3zy"
+NC_FOLDER="TelegramMedia"
+
+get_password() {
+    grep 'Password' "$TOML" 2>/dev/null | grep -oP '(?<=")[^"]+(?=")'
+}
+
+get_sender_name() {
+    grep "POST.*chat/$TALK_TOKEN.*actorDisplayName=.*Go-http-client" \
+        /var/log/apache2/nextcloud_access.log 2>/dev/null \
+        | tail -1 \
+        | grep -oP '(?<=actorDisplayName=)[^& ]+' \
+        | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null
+}
+
+delete_url_message() {
+    local pw="$1"
+    local response msg_id
+
+    # Fetch last 10 messages as JSON, find the bridge-bot URL relay message
+    response=$(curl -s \
+        -u "$BRIDGE_USER:$pw" \
+        -H "OCS-APIREQUEST: true" \
+        "$NC_URL/ocs/v2.php/apps/spreed/api/v1/chat/$TALK_TOKEN?lookIntoFuture=0&limit=10&format=json")
+
+    msg_id=$(echo "$response" | python3 -c "
+import sys, json
+try:
+    for msg in json.load(sys.stdin).get('ocs',{}).get('data',[]):
+        if msg.get('actorId') == 'bridge-bot' and 'matterbridge-media' in msg.get('message',''):
+            print(msg['id'])
+            break
+except: pass
+" 2>/dev/null)
+
+    [ -n "$msg_id" ] && curl -s -X DELETE \
+        -u "$BRIDGE_USER:$pw" \
+        -H "OCS-APIREQUEST: true" \
+        "$NC_URL/ocs/v2.php/apps/spreed/api/v1/chat/$TALK_TOKEN/$msg_id" \
+        -o /dev/null
+}
+
+upload_and_share() {
+    local filepath="$1"
+    local filename
+    filename=$(basename "$filepath")
+    local pw
+    pw=$(get_password)
+
+    [ -z "$pw" ] && return 1
+    [ ! -s "$filepath" ] && return 1
+
+    # Ensure folder exists in bridge-bot's NC storage
+    curl -s -X MKCOL -u "$BRIDGE_USER:$pw" \
+        "$NC_URL/remote.php/dav/files/$BRIDGE_USER/$NC_FOLDER/" -o /dev/null
+
+    # Upload file via WebDAV
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -T "$filepath" \
+        -u "$BRIDGE_USER:$pw" \
+        "$NC_URL/remote.php/dav/files/$BRIDGE_USER/$NC_FOLDER/$filename")
+
+    if [ "$http_code" = "201" ] || [ "$http_code" = "204" ]; then
+        # Wait for Nextcloud to index the file and for Matterbridge to
+        # post the URL message so we can find and delete it
+        sleep 2
+
+        # Delete the URL text message Matterbridge sent (unavoidable side effect)
+        delete_url_message "$pw"
+
+        # Send attribution so the Telegram sender is visible
+        local sender
+        sender=$(get_sender_name)
+        if [ -n "$sender" ]; then
+            curl -s -X POST \
+                -u "$BRIDGE_USER:$pw" \
+                -H "OCS-APIREQUEST: true" \
+                "$NC_URL/ocs/v2.php/apps/spreed/api/v1/chat/$TALK_TOKEN" \
+                --data-urlencode "message=📷 $sender (Telegram):" \
+                -o /dev/null
+        fi
+
+        # Share file — renders as native inline image attachment in Talk
+        curl -s -X POST \
+            -u "$BRIDGE_USER:$pw" \
+            -H "OCS-APIREQUEST: true" \
+            "$NC_URL/ocs/v2.php/apps/files_sharing/api/v1/shares" \
+            -d "path=/$NC_FOLDER/$filename&shareType=10&shareWith=$TALK_TOKEN" \
+            -o /dev/null
+    fi
+}
+
+# Matterbridge creates a new subdirectory then immediately writes the file.
+# Watch for new directories; once seen, poll up to 5s for the file to appear
+# (avoids the race condition of sub-inotifywait starting after the write).
+inotifywait -m -e create "$MEDIA_DIR" --format '%w%f' 2>/dev/null \
+| while read -r dirpath; do
+    [ ! -d "$dirpath" ] && continue
+    (
+        for i in $(seq 1 5); do
+            filepath=$(find "$dirpath" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | head -1)
+            if [ -n "$filepath" ]; then
+                upload_and_share "$filepath"
+                break
+            fi
+            sleep 1
+        done
+    ) &
+done

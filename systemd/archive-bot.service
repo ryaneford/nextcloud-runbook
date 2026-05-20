@@ -1,0 +1,12 @@
+[Unit]
+Description=Nextcloud Talk archive.ph bot
+After=network.target apache2.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/archive-bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

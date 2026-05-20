@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+import base64
+import hashlib
+import hmac as hmac_lib
+import json
+import re
+import secrets
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler
+from socketserver import ThreadingTCPServer
+
+SECRET = b"74d9fdfe6b22a47b6d05f327303797a3207dad71b1982f227a23e1fecef32d36"
+NC_URL = "https://next.minitrash.com"
+NC_ADMIN_USER = "admin"
+NC_ADMIN_PASS = "cyPVBoLNCSjZppl5rIdaF0crbYug0WLBaiVvzKcdCUTbuvzjF7YdXrIKCxqbs8PYe0ZnwvQc"
+PORT = 9876
+
+UA = "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0"
+
+PAYWALL_DOMAINS = {
+    "nytimes.com", "wsj.com", "washingtonpost.com", "theatlantic.com",
+    "ft.com", "bloomberg.com", "newyorker.com", "wired.com",
+    "economist.com", "hbr.org", "foreignpolicy.com", "latimes.com",
+    "bostonglobe.com", "sfchronicle.com", "telegraph.co.uk",
+    "thetimes.co.uk", "theinformation.com", "businessinsider.com",
+    "seekingalpha.com", "spectator.co.uk", "technologyreview.com",
+    "scientificamerican.com", "nationalgeographic.com",
+    "chicagotribune.com", "nypost.com", "thehill.com",
+    "axios.com", "politico.com", "thedailybeast.com",
+}
+
+URL_RE = re.compile(r'https?://[^\s<>"\'\)\]]+')
+
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_reader", "srnd", "ref", "ref_", "referer", "source",
+    "fbclid", "gclid", "twclid", "igshid", "mc_cid", "mc_eid",
+    "_hsenc", "_hsmi", "s", "smid", "smtyp", "dicbo",
+}
+
+
+def clean_url(url):
+    """Strip tracking query parameters that prevent archive lookups from matching."""
+    p = urllib.parse.urlparse(url)
+    qs = {k: v for k, v in urllib.parse.parse_qs(p.query, keep_blank_values=True).items()
+          if k.lower() not in TRACKING_PARAMS}
+    return urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(qs, doseq=True)))
+
+
+def is_paywalled(url):
+    try:
+        netloc = urllib.parse.urlparse(url).netloc.lower().removeprefix("www.")
+        return any(netloc == d or netloc.endswith("." + d) for d in PAYWALL_DOMAINS)
+    except Exception:
+        return False
+
+
+def get_archive_url(url):
+    """Return a direct archive URL. Falls back to ?url= form if nothing is found."""
+    lookup_url = clean_url(url)
+
+    # 1. Check archive.ph for existing snapshot using cleaned URL
+    for candidate in ([lookup_url] if lookup_url == url else [lookup_url, url]):
+        try:
+            req = urllib.request.Request(
+                "https://archive.ph/newest/" + candidate,
+                headers={"User-Agent": UA},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.url
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print(f"archive.ph newest: HTTP {e.code}", flush=True)
+        except Exception as e:
+            print(f"archive.ph newest: {e}", flush=True)
+
+    # 2. Check Wayback Machine for existing snapshot
+    try:
+        api = f"https://archive.org/wayback/available?url={urllib.parse.quote(lookup_url)}"
+        with urllib.request.urlopen(api, timeout=10) as resp:
+            snap = json.load(resp).get("archived_snapshots", {}).get("closest", {})
+            if snap.get("available") and snap.get("url"):
+                return snap["url"]
+    except Exception:
+        pass
+
+    # 3. Fallback: let user save it themselves
+    return "https://archive.ph/?url=" + urllib.parse.quote(lookup_url, safe="")
+
+
+def send_bot_message(token, message, reply_to=None):
+    random_val = secrets.token_hex(32)
+    sig = hmac_lib.new(SECRET, (random_val + message).encode(), hashlib.sha256).hexdigest()
+    data = {"message": message}
+    if reply_to is not None:
+        data["replyTo"] = reply_to
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(
+        f"{NC_URL}/ocs/v2.php/apps/spreed/api/v1/bot/{token}/message",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+            "X-Nextcloud-Talk-Bot-Random": random_val,
+            "X-Nextcloud-Talk-Bot-Signature": sig,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as e:
+        print(f"send error: {e}", flush=True)
+
+
+def delete_message(token, msg_id):
+    creds = f"{NC_ADMIN_USER}:{NC_ADMIN_PASS}"
+    b64 = base64.b64encode(creds.encode()).decode()
+    req = urllib.request.Request(
+        f"{NC_URL}/ocs/v2.php/apps/spreed/api/v1/chat/{token}/{msg_id}",
+        headers={"Authorization": f"Basic {b64}", "OCS-APIRequest": "true"},
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as e:
+        print(f"delete error: {e}", flush=True)
+
+
+def process_webhook(body, headers):
+    random_hdr = headers.get("X-Nextcloud-Talk-Random", "")
+    received_sig = headers.get("X-Nextcloud-Talk-Signature", "").lower()
+    expected_sig = hmac_lib.new(SECRET, random_hdr.encode() + body, hashlib.sha256).hexdigest()
+    if not hmac_lib.compare_digest(expected_sig, received_sig):
+        return
+
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return
+
+    if payload.get("type") != "Create":
+        return
+    if payload.get("actor", {}).get("id", "").startswith("bots/"):
+        return
+
+    obj = payload.get("object", {})
+    token = payload.get("target", {}).get("id", "")
+    msg_id_str = obj.get("id", "")
+    content_raw = obj.get("content", "")
+
+    try:
+        text = json.loads(content_raw).get("message", "")
+    except Exception:
+        text = content_raw
+
+    paywalled = [u for u in URL_RE.findall(text) if is_paywalled(u)]
+    if not paywalled:
+        return
+
+    reply_to = int(msg_id_str) if msg_id_str.isdigit() else None
+
+    for url in paywalled:
+        archive = get_archive_url(url)
+        print(f"archive: {url} -> {archive}", flush=True)
+        send_bot_message(token, f"🔓 {archive}", reply_to=reply_to)
+
+    if msg_id_str.isdigit():
+        delete_message(token, msg_id_str)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        self.send_response(200)
+        self.end_headers()
+        headers = {k: v for k, v in self.headers.items()}
+        threading.Thread(target=process_webhook, args=(body, headers), daemon=True).start()
+
+    def log_message(self, *args):
+        pass
+
+
+class ReusingServer(ThreadingTCPServer):
+    allow_reuse_address = True
+
+
+if __name__ == "__main__":
+    server = ReusingServer(("127.0.0.1", PORT), Handler)
+    print(f"archive-bot listening on 127.0.0.1:{PORT}", flush=True)
+    server.serve_forever()

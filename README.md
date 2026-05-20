@@ -1,6 +1,6 @@
 # Nextcloud Talk Server — Installation Runbook
 
-Self-hosted Nextcloud 33 with Talk, Music, Telegram bridge, and hardware video transcoding.
+Self-hosted Nextcloud 33 with Talk, Music, Telegram bridge, hardware video transcoding, fail2ban hardening, and a Talk bot that auto-archives paywalled links.
 Designed for a Proxmox VM behind NGINX Proxy Manager and Cloudflare.
 
 ---
@@ -183,7 +183,8 @@ $OCC config:system:set defaultapp --value='spreed'
 $OCC config:system:set maintenance_window_start --value=1 --type=integer
 $OCC config:system:set upgrade.disable-web --value=true --type=boolean
 
-# Video previews
+# Preview providers — requires php8.4-imagick + libheif1 for HEIC/TIFF/WebP/PDF
+# ghostscript required for PDF previews (apt-get install -y ghostscript)
 $OCC config:system:set enabledPreviewProviders 0 --value='OC\Preview\PNG'
 $OCC config:system:set enabledPreviewProviders 1 --value='OC\Preview\JPEG'
 $OCC config:system:set enabledPreviewProviders 2 --value='OC\Preview\GIF'
@@ -196,6 +197,11 @@ $OCC config:system:set enabledPreviewProviders 8 --value='OC\Preview\Movie'
 $OCC config:system:set enabledPreviewProviders 9 --value='OC\Preview\MKV'
 $OCC config:system:set enabledPreviewProviders 10 --value='OC\Preview\MP4'
 $OCC config:system:set enabledPreviewProviders 11 --value='OC\Preview\AVI'
+$OCC config:system:set enabledPreviewProviders 12 --value='OC\Preview\HEIC'
+$OCC config:system:set enabledPreviewProviders 13 --value='OC\Preview\TIFF'
+$OCC config:system:set enabledPreviewProviders 14 --value='OC\Preview\WebP'
+$OCC config:system:set enabledPreviewProviders 15 --value='OC\Preview\PDF'
+$OCC config:system:set enabledPreviewProviders 16 --value='OC\Preview\ICO'
 $OCC config:system:set preview_max_x --value=2048 --type=integer
 $OCC config:system:set preview_max_y --value=2048 --type=integer
 $OCC config:system:set preview_max_filesize_image --value=50 --type=integer
@@ -705,7 +711,222 @@ These settings fix video streaming buffering and range request handling.
 
 ---
 
-## 12. Post-Install Checklist
+## 12. coturn TURN Server
+
+Required for Talk video/audio calls through NAT (cellular, strict home ISPs).
+
+```bash
+apt-get install -y coturn
+```
+
+`/etc/turnserver.conf`:
+
+```ini
+listening-port=3478
+tls-listening-port=5349
+listening-ip=0.0.0.0
+cert=/etc/letsencrypt/live/turn.your.domain.com/fullchain.pem
+pkey=/etc/letsencrypt/live/turn.your.domain.com/privkey.pem
+relay-ip=YOUR_LAN_IP
+external-ip=YOUR_PUBLIC_IP/YOUR_LAN_IP
+min-port=49152
+max-port=65535
+realm=turn.your.domain.com
+server-name=turn.your.domain.com
+use-auth-secret
+static-auth-secret=YOUR_TURN_SECRET
+no-multicast-peers
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+fingerprint
+log-file=/var/log/turnserver.log
+simple-log
+```
+
+> **Port range:** `49152–65535` — each call uses ~4 ports. The range `49152–49162` (10 ports) only handles ~2 concurrent calls. Forward the full range TCP+UDP on your router.
+
+Register in Nextcloud Talk admin panel (Settings → Talk → TURN servers) or via occ:
+
+```bash
+# Generate a random secret
+openssl rand -hex 32
+
+# Add TURN server in Talk admin UI or directly via DB
+# Talk admin: Settings → Talk → TURN servers → add turns:turn.your.domain.com:5349
+```
+
+```bash
+systemctl enable --now coturn
+```
+
+---
+
+## 13. Fail2ban
+
+Protects against brute-force login attempts on Nextcloud and SSH.
+
+```bash
+apt-get install -y fail2ban
+```
+
+`/etc/fail2ban/filter.d/nextcloud.conf` (see `fail2ban/filter.d/nextcloud.conf`):
+
+```ini
+[Definition]
+failregex = .*"remoteAddr":"<HOST>".*"message":"Login failed:.*
+            .*"remoteAddr":"<HOST>".*"message":"Trusted domain error.*
+ignoreregex =
+datepattern = "time"\s*:\s*"%%Y-%%m-%%dT%%H:%%M:%%S
+```
+
+`/etc/fail2ban/jail.d/nextcloud.conf` (see `fail2ban/jail.d/nextcloud.conf`):
+
+```ini
+[nextcloud]
+enabled  = true
+port     = http,https,11000
+filter   = nextcloud
+logpath  = /var/ncdata/nextcloud.log
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+action   = iptables-multiport[name=nextcloud, port="http,https,11000", protocol=tcp]
+
+[apache-auth]
+enabled  = true
+port     = http,https,11000
+filter   = apache-auth
+logpath  = /var/log/apache2/nextcloud_error.log
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+
+[apache-badbots]
+enabled  = true
+port     = http,https,11000
+filter   = apache-badbots
+logpath  = /var/log/apache2/nextcloud_access.log
+maxretry = 2
+findtime = 10m
+bantime  = 24h
+
+[sshd]
+enabled  = true
+port     = ssh
+filter   = sshd
+logpath  = /var/log/auth.log
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+```
+
+```bash
+systemctl enable --now fail2ban
+
+# Verify all 4 jails loaded
+fail2ban-client status
+
+# Test filter against your log
+fail2ban-regex /var/ncdata/nextcloud.log /etc/fail2ban/filter.d/nextcloud.conf
+```
+
+---
+
+## 14. Archive Bot (Talk)
+
+A Nextcloud Talk bot that intercepts paywalled links, fetches the archive.ph snapshot (or Wayback Machine fallback), posts the direct archive URL as a threaded reply, and deletes the original message.
+
+Works for links posted from both Talk and Telegram (via the bridge).
+
+### Prerequisites
+
+```bash
+# Generate bot secret and admin app password
+openssl rand -hex 32   # use as BOT_SECRET below
+
+# Generate admin app password (needed to delete messages as moderator)
+su -s /bin/bash www-data -c \
+  "php8.4 /home/nextcloud/occ user:auth-tokens:add --name 'archive-bot-delete' admin"
+```
+
+### Bot Script
+
+See `scripts/archive-bot`. Update these variables at the top:
+
+| Variable | Description |
+|---|---|
+| `SECRET` | 32-byte hex secret generated above |
+| `NC_URL` | Your Nextcloud URL |
+| `NC_ADMIN_PASS` | App password generated above |
+
+```bash
+cp scripts/archive-bot /usr/local/bin/archive-bot
+chmod +x /usr/local/bin/archive-bot
+```
+
+### Add Admin to Rooms (required for message deletion)
+
+Admin must be a moderator in every room where the bot is active:
+
+```bash
+OCC="su -s /bin/bash www-data -c 'php8.4 /home/nextcloud/occ'"
+
+# Add and promote admin in each room (repeat per room token)
+$OCC talk:room:add --user admin ROOM_TOKEN
+$OCC talk:room:promote ROOM_TOKEN admin
+```
+
+### Systemd Service
+
+See `systemd/archive-bot.service`:
+
+```bash
+cp systemd/archive-bot.service /etc/systemd/system/archive-bot.service
+systemctl daemon-reload
+systemctl enable --now archive-bot
+```
+
+### Register and Enable Bot
+
+```bash
+# Register system-wide (run once)
+php8.4 /home/nextcloud/occ talk:bot:install \
+  "archive-bot" \
+  "BOT_SECRET" \
+  "http://127.0.0.1:9876" \
+  "Replies with archive.ph links for paywalled URLs"
+
+# Check assigned ID
+php8.4 /home/nextcloud/occ talk:bot:list
+
+# Enable in each room (repeat per room token)
+php8.4 /home/nextcloud/occ talk:bot:setup BOT_ID ROOM_TOKEN
+```
+
+### How It Works
+
+1. Talk sends a webhook to `http://127.0.0.1:9876` for every message
+2. Bot verifies HMAC-SHA256 signature using the shared secret
+3. Extracts URLs and checks domain against paywall list
+4. Strips tracking query parameters (`utm_*`, `srnd`, `fbclid`, etc.) before archive lookup
+5. Tries `archive.ph/newest/{url}` — returns direct timestamped URL if found
+6. Falls back to Wayback Machine availability check
+7. Posts archive URL as a threaded reply using the bot API
+8. Deletes the original message using admin credentials
+
+### Adding Paywall Domains
+
+Edit the `PAYWALL_DOMAINS` set in `/usr/local/bin/archive-bot` and restart:
+
+```bash
+systemctl restart archive-bot
+```
+
+---
+
+## 15. Post-Install Checklist
 
 - [ ] Test video upload in Talk — confirm auto-transcode triggers for files > 10 Mbps
 - [ ] Test SMTP — Admin → Basic Settings → Send test email
@@ -714,10 +935,12 @@ These settings fix video streaming buffering and range request handling.
 - [ ] Send a photo from Telegram — confirm it appears as inline image in Talk
 - [ ] Share a photo in Talk — confirm it appears in Telegram
 - [ ] Verify SMB music mount is read-only (`files_external:verify 1`)
-- [ ] Confirm `nc-video-watcher` and `mb-media-to-talk` services are running
+- [ ] Post a paywalled link — confirm archive-bot replies with direct archive URL and deletes original
+- [ ] Verify fail2ban jails are active: `fail2ban-client status`
+- [ ] Confirm all services are running
 
 ```bash
-systemctl status nc-video-watcher mb-media-to-talk
+systemctl status nc-video-watcher mb-media-to-talk archive-bot fail2ban coturn
 ```
 
 ---
@@ -732,9 +955,14 @@ systemctl status nc-video-watcher mb-media-to-talk
 | `/usr/local/bin/nc-transcode-video` | Hardware transcode script |
 | `/usr/local/bin/nc-video-watcher` | Talk video upload watcher |
 | `/usr/local/bin/mb-media-to-talk` | Telegram media relay |
+| `/usr/local/bin/archive-bot` | Paywalled link archive bot |
 | `/var/matterbridge-media/` | Temp media storage for bridge |
 | `/var/ncdata/` | Nextcloud data directory |
 | `/tmp/bridge-ROOM_TOKEN.toml` | Active Matterbridge config (auto-generated) |
 | `/tmp/bridge-ROOM_TOKEN.log` | Matterbridge live log |
 | `/home/nextcloud/apps/spreed/lib/MatterbridgeManager.php` | Patched for native message formatting |
 | `/var/log/apache2/nextcloud_access.log` | Apache access log (used by relay service) |
+| `/var/ncdata/nextcloud.log` | Nextcloud application log (used by fail2ban) |
+| `/etc/fail2ban/filter.d/nextcloud.conf` | Fail2ban filter for Nextcloud login failures |
+| `/etc/fail2ban/jail.d/nextcloud.conf` | Fail2ban jails (Nextcloud, Apache, SSH) |
+| `/etc/turnserver.conf` | coturn TURN server config |
