@@ -1,7 +1,43 @@
 # Nextcloud Talk Server — Installation Runbook
 
-Self-hosted Nextcloud 33 with Talk, Music, Telegram bridge, hardware video transcoding, fail2ban hardening, and a Talk bot that auto-archives paywalled links.
-Designed for a Proxmox VM behind NGINX Proxy Manager and Cloudflare.
+A fully self-hosted Nextcloud 33 stack with Talk, Music, a Telegram bridge with native media relay, fail2ban hardening, a TURN server for video calls, and a Talk bot that auto-archives paywalled links.
+
+Designed for a Debian VM behind NGINX Proxy Manager and Cloudflare, but adaptable to any reverse-proxy setup.
+
+---
+
+## Configuration Variables
+
+Replace these placeholders throughout this guide before running any commands.
+
+| Variable | Description | Example |
+|---|---|---|
+| `YOUR_DOMAIN` | Nextcloud public domain | `next.example.com` |
+| `YOUR_TURN_DOMAIN` | TURN server domain (can be same host) | `turn.example.com` |
+| `YOUR_PUBLIC_IP` | Server public IP | `203.0.113.10` |
+| `YOUR_LAN_IP` | Server LAN IP | `192.168.1.50` |
+| `YOUR_NC_URL` | Full Nextcloud URL | `https://next.example.com` |
+| `YOUR_DB_PASSWORD` | PostgreSQL password for ncuser | — |
+| `YOUR_REDIS_PASSWORD` | Redis requirepass value | — |
+| `YOUR_ADMIN_PASSWORD` | Nextcloud admin account password | — |
+| `YOUR_TURN_SECRET` | coturn shared secret (`openssl rand -hex 32`) | — |
+| `YOUR_TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | `123456:ABC...` |
+| `YOUR_TELEGRAM_GROUP_ID` | Telegram group/channel ID (negative number) | `-1001234567890` |
+| `YOUR_TALK_TOKEN` | Nextcloud Talk room token | `abc12xyz` |
+| `YOUR_SMB_HOST` | NAS/SMB server IP | `192.168.1.10` |
+| `YOUR_SMB_SHARE` | Share name | `data` |
+| `YOUR_SMB_PATH` | Path inside the share | `media/music` |
+| `YOUR_SMB_USER` | SMB username | — |
+| `YOUR_SMB_PASSWORD` | SMB password | — |
+| `YOUR_LASTFM_API_KEY` | Last.fm API key | — |
+| `YOUR_LASTFM_SECRET` | Last.fm shared secret | — |
+| `YOUR_SMTP_HOST` | SMTP server hostname | `smtp.example.com` |
+| `YOUR_SMTP_PORT` | SMTP port | `587` |
+| `YOUR_SMTP_USER` | SMTP username/address | — |
+| `YOUR_SMTP_PASSWORD` | SMTP password or app token | — |
+| `YOUR_SMTP_FROM` | From address | `noreply@example.com` |
+| `YOUR_BOT_SECRET` | Archive bot HMAC secret (`openssl rand -hex 32`) | — |
+| `YOUR_ADMIN_APP_PASS` | Admin app password for archive bot message deletion | — |
 
 ---
 
@@ -15,7 +51,7 @@ Designed for a Proxmox VM behind NGINX Proxy Manager and Cloudflare.
 | Database | PostgreSQL 17 |
 | Cache | Redis 8.0 |
 | Nextcloud | 33.x |
-| Reverse proxy | NGINX Proxy Manager → Cloudflare |
+| Reverse proxy | NGINX Proxy Manager → Cloudflare (or any reverse proxy) |
 
 ---
 
@@ -26,7 +62,7 @@ apt-get update && apt-get upgrade -y
 apt-get install -y apache2 postgresql redis-server php8.4-fpm \
   php8.4-{cli,curl,gd,mbstring,xml,zip,bcmath,gmp,intl,pgsql,apcu,redis,imagick} \
   libapache2-mod-xsendfile inotify-tools ffmpeg smbclient php8.4-smbclient \
-  python3 curl wget git unzip
+  ghostscript python3 curl wget git unzip fail2ban
 
 a2enmod rewrite headers env dir mime proxy_fcgi setenvif remoteip
 a2enconf php8.4-fpm
@@ -37,7 +73,7 @@ systemctl enable --now apache2 postgresql redis-server php8.4-fpm
 
 ```bash
 sudo -u postgres psql <<EOF
-CREATE USER ncuser WITH PASSWORD 'CHANGE_ME';
+CREATE USER ncuser WITH PASSWORD 'YOUR_DB_PASSWORD';
 CREATE DATABASE nextcloud OWNER ncuser;
 GRANT ALL PRIVILEGES ON DATABASE nextcloud TO ncuser;
 EOF
@@ -74,9 +110,9 @@ su -s /bin/sh www-data -c "php /home/nextcloud/occ maintenance:install \
   --database-name nextcloud \
   --database-host 127.0.0.1 \
   --database-user ncuser \
-  --database-pass 'DB_PASSWORD' \
+  --database-pass 'YOUR_DB_PASSWORD' \
   --admin-user admin \
-  --admin-pass 'ADMIN_PASSWORD' \
+  --admin-pass 'YOUR_ADMIN_PASSWORD' \
   --data-dir /var/ncdata"
 ```
 
@@ -88,7 +124,7 @@ su -s /bin/sh www-data -c "php /home/nextcloud/occ maintenance:install \
 
 ```apache
 <VirtualHost *:11000>
-    ServerName your.domain.com
+    ServerName YOUR_DOMAIN
     DocumentRoot /home/nextcloud
 
     <Directory /home/nextcloud>
@@ -117,7 +153,7 @@ su -s /bin/sh www-data -c "php /home/nextcloud/occ maintenance:install \
         SetHandler "proxy:unix:/run/php/php8.4-fpm.sock|fcgi://localhost"
     </FilesMatch>
 
-    # Behind NGINX Proxy Manager
+    # Behind a reverse proxy — adjust RemoteIPInternalProxy to match your proxy's LAN IP
     SetEnvIf X-Forwarded-Proto https HTTPS=on
     RemoteIPHeader X-Forwarded-For
     RemoteIPInternalProxy 127.0.0.1
@@ -142,22 +178,24 @@ apache2ctl configtest && systemctl reload apache2
 
 ## 3. Nextcloud config.php
 
-All set via occ — do not edit config.php directly.
+All set via occ — do not edit config.php directly (PHP-FPM opcache will serve a stale compiled version).
+
+> **Note:** If you must edit config.php directly, run `systemctl restart php8.4-fpm` afterwards and immediately `chown www-data:www-data /home/nextcloud/config/config.php` — editing as root changes file ownership and breaks the web app.
 
 ```bash
 OCC="su -s /bin/sh www-data -c 'php /home/nextcloud/occ'"
 
 # Domain
-$OCC config:system:set trusted_domains 0 --value='your.domain.com'
-$OCC config:system:set overwrite.cli.url --value='https://your.domain.com'
+$OCC config:system:set trusted_domains 0 --value='YOUR_DOMAIN'
+$OCC config:system:set overwrite.cli.url --value='YOUR_NC_URL'
 $OCC config:system:set overwriteprotocol --value='https'
-$OCC config:system:set overwritehost --value='your.domain.com'
+$OCC config:system:set overwritehost --value='YOUR_DOMAIN'
 
-# Cloudflare trusted proxies (full list at cloudflare.com/ips)
+# Trusted proxies — add your reverse proxy LAN IP and Cloudflare ranges if applicable
 $OCC config:system:set trusted_proxies 0 --value='127.0.0.1'
-$OCC config:system:set trusted_proxies 1 --value='YOUR_NPM_LAN_IP'
-# ... add Cloudflare IP ranges
+$OCC config:system:set trusted_proxies 1 --value='YOUR_PROXY_LAN_IP'
 
+# If behind Cloudflare, use CF-Connecting-IP for real client IP
 $OCC config:system:set forwarded_for_headers 0 --value='HTTP_CF_CONNECTING_IP'
 $OCC config:system:set forwarded_for_headers 1 --value='HTTP_X_FORWARDED_FOR'
 
@@ -176,15 +214,15 @@ $OCC config:system:set logfile --value='/var/ncdata/nextcloud.log'
 # XSendFile
 $OCC config:system:set enable_xsendfile --value=true --type=boolean
 
-# Misc
-$OCC config:system:set default_phone_region --value='CA'
-$OCC config:system:set default_timezone --value='America/Toronto'
+# Locale — adjust to your region
+$OCC config:system:set default_phone_region --value='US'
+$OCC config:system:set default_timezone --value='America/New_York'
 $OCC config:system:set defaultapp --value='spreed'
 $OCC config:system:set maintenance_window_start --value=1 --type=integer
 $OCC config:system:set upgrade.disable-web --value=true --type=boolean
 
 # Preview providers — requires php8.4-imagick + libheif1 for HEIC/TIFF/WebP/PDF
-# ghostscript required for PDF previews (apt-get install -y ghostscript)
+# ghostscript required for PDF previews (included in base install above)
 $OCC config:system:set enabledPreviewProviders 0 --value='OC\Preview\PNG'
 $OCC config:system:set enabledPreviewProviders 1 --value='OC\Preview\JPEG'
 $OCC config:system:set enabledPreviewProviders 2 --value='OC\Preview\GIF'
@@ -212,10 +250,9 @@ $OCC config:system:set preview_max_filesize_image --value=50 --type=integer
 ## 4. Users
 
 ```bash
-for user in ryan mike jimm dave; do
-  su -s /bin/sh www-data -c "php /home/nextcloud/occ user:add \
-    --display-name='${user^}' --password-from-env $user" <<< "USER_PASSWORD"
-done
+# Add users — repeat for each person
+su -s /bin/sh www-data -c "php /home/nextcloud/occ user:add \
+  --display-name='Alice' --password-from-env alice" <<< "THEIR_PASSWORD"
 ```
 
 ---
@@ -252,152 +289,27 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
 ---
 
-## 6. SMTP (ProtonMail)
+## 6. SMTP
 
 ```bash
 OCC="su -s /bin/sh www-data -c 'php /home/nextcloud/occ'"
 $OCC config:system:set mail_smtpmode --value='smtp'
-$OCC config:system:set mail_smtphost --value='smtp.protonmail.ch'
-$OCC config:system:set mail_smtpport --value='587'
+$OCC config:system:set mail_smtphost --value='YOUR_SMTP_HOST'
+$OCC config:system:set mail_smtpport --value='YOUR_SMTP_PORT'
 $OCC config:system:set mail_smtpsecure --value='tls'
 $OCC config:system:set mail_smtpauth --value=1 --type=integer
 $OCC config:system:set mail_smtpauthtype --value='LOGIN'
-$OCC config:system:set mail_smtpname --value='noreply@yourdomain.com'
-$OCC config:system:set mail_smtppassword --value='YOUR_SMTP_TOKEN'
+$OCC config:system:set mail_smtpname --value='YOUR_SMTP_USER'
+$OCC config:system:set mail_smtppassword --value='YOUR_SMTP_PASSWORD'
 $OCC config:system:set mail_from_address --value='noreply'
-$OCC config:system:set mail_domain --value='yourdomain.com'
+$OCC config:system:set mail_domain --value='YOUR_DOMAIN'
 ```
 
 Test via Admin → Basic Settings → Send test email.
 
 ---
 
-## 7. Hardware Video Transcoding (Plex LXC)
-
-Offloads high-bitrate Talk video uploads to an Intel iGPU in a Plex LXC container.
-Only transcodes files above 10 Mbps. Uses VA-API with CQP mode (QP=38 ≈ 8-10 Mbps output).
-
-### SSH Key Setup
-
-```bash
-ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519_transcode -N "" -C "nextcloud-transcode@yourdomain"
-# Append public key to Plex LXC's /root/.ssh/authorized_keys
-ssh-copy-id -i /root/.ssh/id_ed25519_transcode root@PLEX_LXC_IP
-```
-
-### Transcode Script
-
-`/usr/local/bin/nc-transcode-video`:
-
-```bash
-#!/bin/bash
-FILE="$1"
-NC_USER="$2"
-PLEX_HOST="PLEX_LXC_IP"
-PLEX_SSH="ssh -i /root/.ssh/id_ed25519_transcode -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$PLEX_HOST"
-PLEX_SCP="scp -i /root/.ssh/id_ed25519_transcode -o StrictHostKeyChecking=no"
-TMPDIR_REMOTE="/tmp/nc-transcode"
-OCC=/home/nextcloud/occ
-AUDIO_BITRATE=128k
-
-prev=0
-for i in $(seq 1 30); do
-    cur=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-    [ "$cur" -eq "$prev" ] && [ "$cur" -gt 0 ] && break
-    prev=$cur; sleep 3
-done
-
-[ ! -s "$FILE" ] && exit 0
-
-bitrate=$(ffprobe -v quiet -print_format json -show_format "$FILE" 2>/dev/null \
-  | python3 -c "import json,sys; d=json.load(sys.stdin); print(int(d['format'].get('bit_rate',0)))" 2>/dev/null)
-[ -z "$bitrate" ] || [ "$bitrate" -le 10000000 ] && exit 0
-
-BASENAME=$(basename "$FILE")
-REMOTE_IN="$TMPDIR_REMOTE/$BASENAME"
-REMOTE_OUT="$TMPDIR_REMOTE/out_$BASENAME"
-
-$PLEX_SSH "mkdir -p $TMPDIR_REMOTE" || exit 1
-$PLEX_SCP "$FILE" "root@$PLEX_HOST:$REMOTE_IN" || exit 1
-
-# Intel 6th gen iHD only supports CQP — QP 38 ≈ 8-10 Mbps
-$PLEX_SSH "ffmpeg -y \
-  -vaapi_device /dev/dri/renderD128 \
-  -i '$REMOTE_IN' \
-  -vf 'format=nv12,hwupload' \
-  -c:v h264_vaapi -qp 38 \
-  -c:a aac -b:a $AUDIO_BITRATE \
-  -movflags +faststart -map_metadata 0 \
-  '$REMOTE_OUT' 2>/dev/null"
-
-[ $? -ne 0 ] && { $PLEX_SSH "rm -f '$REMOTE_IN' '$REMOTE_OUT'"; exit 1; }
-
-TMPLOCAL="${FILE%.mp4}_new.mp4"
-$PLEX_SCP "root@$PLEX_HOST:$REMOTE_OUT" "$TMPLOCAL"
-
-if [ $? -eq 0 ] && [ -s "$TMPLOCAL" ]; then
-    chown www-data:www-data "$TMPLOCAL"
-    mv "$TMPLOCAL" "$FILE"
-    chown www-data:www-data "$FILE"
-    su -s /bin/sh www-data -c "php $OCC files:scan --path='/$NC_USER/files' -q" 2>/dev/null
-fi
-
-$PLEX_SSH "rm -f '$REMOTE_IN' '$REMOTE_OUT'"
-rm -f "$TMPLOCAL"
-```
-
-### Video Watcher
-
-`/usr/local/bin/nc-video-watcher`:
-
-```bash
-#!/bin/bash
-DATA_DIR=/var/ncdata
-USERS=(ryan mike jimm dave)
-VIDEO_EXTS="mp4|mkv|avi|mov|wmv|webm|flv|m4v"
-
-WATCH_PATHS=()
-for u in "${USERS[@]}"; do
-    dir="$DATA_DIR/$u/files/Talk"
-    mkdir -p "$dir" && chown www-data:www-data "$dir"
-    WATCH_PATHS+=("$dir")
-done
-
-inotifywait -m -e close_write --format '%w%f' "${WATCH_PATHS[@]}" 2>/dev/null \
-| while read -r filepath; do
-    if echo "$filepath" | grep -qiE "\.($VIDEO_EXTS)$"; then
-        nc_user=$(echo "$filepath" | sed "s|$DATA_DIR/||;s|/.*||")
-        /usr/local/bin/nc-transcode-video "$filepath" "$nc_user" &
-    fi
-done
-```
-
-`/etc/systemd/system/nc-video-watcher.service`:
-
-```ini
-[Unit]
-Description=Nextcloud Talk video transcoder
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/nc-video-watcher
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-chmod +x /usr/local/bin/nc-transcode-video /usr/local/bin/nc-video-watcher
-systemctl daemon-reload
-systemctl enable --now nc-video-watcher
-```
-
----
-
-## 8. Nextcloud Music + SMB Library
+## 7. Nextcloud Music + SMB Library
 
 ### Install
 
@@ -413,19 +325,17 @@ su -s /bin/sh www-data -c "php /home/nextcloud/occ app:enable files_external"
 su -s /bin/sh www-data -c "php /home/nextcloud/occ files_external:create 'Music Library' smb password::password"
 
 su -s /bin/sh www-data -c "
-php /home/nextcloud/occ files_external:config 1 host SMB_SERVER_IP
-php /home/nextcloud/occ files_external:config 1 share SHARE_NAME
-php /home/nextcloud/occ files_external:config 1 root 'path/to/music'
-php /home/nextcloud/occ files_external:config 1 user SMB_USERNAME
-php /home/nextcloud/occ files_external:config 1 password SMB_PASSWORD
+php /home/nextcloud/occ files_external:config 1 host YOUR_SMB_HOST
+php /home/nextcloud/occ files_external:config 1 share YOUR_SMB_SHARE
+php /home/nextcloud/occ files_external:config 1 root 'YOUR_SMB_PATH'
+php /home/nextcloud/occ files_external:config 1 user YOUR_SMB_USER
+php /home/nextcloud/occ files_external:config 1 password YOUR_SMB_PASSWORD
 php /home/nextcloud/occ files_external:config 1 domain ''
 php /home/nextcloud/occ files_external:option 1 read_only 1
 "
 
 # Grant access to each user
-for user in ryan mike jimm dave; do
-  su -s /bin/sh www-data -c "php /home/nextcloud/occ files_external:applicable --add-user $user 1"
-done
+su -s /bin/sh www-data -c "php /home/nextcloud/occ files_external:applicable --add-user alice 1"
 
 # Verify connection
 su -s /bin/sh www-data -c "php /home/nextcloud/occ files_external:verify 1"
@@ -434,38 +344,27 @@ su -s /bin/sh www-data -c "php /home/nextcloud/occ files_external:verify 1"
 ### Scan & Index
 
 ```bash
-# Run per user — takes ~20 minutes for a large library
-su -s /bin/sh www-data -c "php /home/nextcloud/occ files:scan --path='/ryan/files/Music Library'"
-su -s /bin/sh www-data -c "php /home/nextcloud/occ music:scan ryan"
-# Repeat for other users
+# Run per user — may take a while for large libraries
+su -s /bin/sh www-data -c "php /home/nextcloud/occ files:scan --path='/alice/files/Music Library'"
+su -s /bin/sh www-data -c "php /home/nextcloud/occ music:scan alice"
 ```
 
 ### Last.fm Scrobbling
 
-Register a free API app at https://www.last.fm/api/account/create (only Contact email and App name required).
+Register a free API app at https://www.last.fm/api/account/create (only contact email and app name required).
 
 ```bash
 su -s /bin/sh www-data -c "
 php /home/nextcloud/occ config:system:set music.lastfm_api_key --value='YOUR_LASTFM_API_KEY'
-php /home/nextcloud/occ config:system:set music.lastfm_api_secret --value='YOUR_LASTFM_API_SECRET'
+php /home/nextcloud/occ config:system:set music.lastfm_api_secret --value='YOUR_LASTFM_SECRET'
 "
 ```
 
-Each user then connects their own Last.fm account via Music → Settings → Connect.
-
-### Music Admin Settings
-
-```bash
-su -s /bin/sh www-data -c "
-php /home/nextcloud/occ config:system:set music.cover_size --value=500 --type=integer
-php /home/nextcloud/occ config:system:set music.ampache_session_expiry_time --value=86400 --type=integer
-php /home/nextcloud/occ config:system:set music.podcast_auto_update_interval --value=12 --type=float
-"
-```
+Each user connects their own Last.fm account via Music → Settings → Connect.
 
 ---
 
-## 9. Telegram ↔ Talk Bridge (Matterbridge)
+## 8. Telegram ↔ Talk Bridge (Matterbridge)
 
 Bridges a Nextcloud Talk room to a Telegram group. Text and media relay in both directions.
 
@@ -496,30 +395,32 @@ sudo -u postgres psql nextcloud -c "
 INSERT INTO oc_talk_bridges (room_id, json_values, enabled, pid)
 VALUES (
   ROOM_ID,
-  '[{\"type\":\"telegram\",\"token\":\"BOT_TOKEN\",\"channel\":\"TELEGRAM_GROUP_ID\"}]',
+  '[{\"type\":\"telegram\",\"token\":\"YOUR_TELEGRAM_BOT_TOKEN\",\"channel\":\"YOUR_TELEGRAM_GROUP_ID\"}]',
   1, 0
 );"
 ```
 
 Telegram group IDs are negative numbers. Get yours by adding your bot to the group and calling:
-`https://api.telegram.org/botTOKEN/getUpdates`
+`https://api.telegram.org/botYOUR_TELEGRAM_BOT_TOKEN/getUpdates`
 
 ### Activate via Talk API
 
 ```bash
 curl -s -X PUT \
-  -u "USERNAME:APP_PASSWORD" \
+  -u "admin:YOUR_ADMIN_PASSWORD" \
   -H "OCS-APIREQUEST: true" \
   -H "Content-Type: application/json" \
-  "https://your.domain.com/ocs/v2.php/apps/spreed/api/v1/bridge/ROOM_TOKEN" \
-  -d '{"parts":[{"type":"telegram","token":"BOT_TOKEN","channel":"TELEGRAM_GROUP_ID"}],"enabled":true}'
+  "YOUR_NC_URL/ocs/v2.php/apps/spreed/api/v1/bridge/YOUR_TALK_TOKEN" \
+  -d '{"parts":[{"type":"telegram","token":"YOUR_TELEGRAM_BOT_TOKEN","channel":"YOUR_TELEGRAM_GROUP_ID"}],"enabled":true}'
 ```
 
 ### Patch MatterbridgeManager.php for Native Formatting
 
-The Talk app generates the Matterbridge config. Two edits improve message appearance and enable media relay.
+The Talk app auto-generates the Matterbridge config. These edits improve message appearance and enable media relay.
 
 **File:** `/home/nextcloud/apps/spreed/lib/MatterbridgeManager.php`
+
+> **Warning:** This file is overwritten on Talk app updates. Re-apply the patch after each update.
 
 **1. Add `[general]` media config** — insert before the `foreach` loop in `generateConfig()`:
 
@@ -527,7 +428,7 @@ The Talk app generates the Matterbridge config. Two edits improve message appear
 private function generateConfig(array $bridge): string {
     $content = '[general]' . "\n";
     $content .= '	MediaDownloadPath = "/var/matterbridge-media"' . "\n";
-    $content .= '	MediaServerDownload = "https://your.domain.com/matterbridge-media"' . "\n";
+    $content .= '	MediaServerDownload = "YOUR_NC_URL/matterbridge-media"' . "\n";
     $content .= '	MediaDownloadSize = 52428800' . "\n\n";
     foreach ($bridge['parts'] as $k => $part) {
 ```
@@ -544,7 +445,7 @@ private function generateConfig(array $bridge): string {
     $content .= '	MediaConvertWebPToPNG = true' . "\n\n";
 ```
 
-**3. Replace the `nctalk` nick/media lines** (find the `PrefixMessagesWithNick` + `RemoteNickFormat` block inside the `nctalk` if-branch):
+**3. Replace the `nctalk` nick/media lines:**
 
 ```php
 $content .= '	PrefixMessagesWithNick = false' . "\n";
@@ -556,7 +457,7 @@ After patching, restart PHP-FPM and re-PUT the bridge via the Talk API to regene
 
 ```bash
 systemctl restart php8.4-fpm
-# Then re-run the curl PUT command from above
+# Then re-run the curl PUT command above
 ```
 
 ### Media Directory
@@ -569,130 +470,23 @@ chmod 755 /var/matterbridge-media
 
 ---
 
-## 10. Telegram Media Relay Service
+## 9. Telegram Media Relay Service
 
 Watches for files Matterbridge downloads from Telegram, uploads them to Nextcloud natively, and shares them in the Talk room as inline image attachments. Deletes the raw URL message Matterbridge posts first.
 
-**Variables to update:** `TOML`, `NC_URL`, `TALK_TOKEN`
-
-`/usr/local/bin/mb-media-to-talk`:
+See `scripts/mb-media-to-talk`. Update `TOML`, `NC_URL`, and `TALK_TOKEN` at the top of the script.
 
 ```bash
-#!/bin/bash
-MEDIA_DIR=/var/matterbridge-media
-BRIDGE_USER="bridge-bot"
-TOML="/tmp/bridge-ROOM_TOKEN.toml"
-NC_URL="https://your.domain.com"
-TALK_TOKEN="ROOM_TOKEN"
-NC_FOLDER="TelegramMedia"
-
-get_password() {
-    grep 'Password' "$TOML" 2>/dev/null | grep -oP '(?<=")[^"]+(?=")'
-}
-
-get_sender_name() {
-    grep "POST.*chat/$TALK_TOKEN.*actorDisplayName=.*Go-http-client" \
-        /var/log/apache2/nextcloud_access.log 2>/dev/null \
-        | tail -1 \
-        | grep -oP '(?<=actorDisplayName=)[^& ]+' \
-        | python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null
-}
-
-delete_url_message() {
-    local pw="$1"
-    local response msg_id
-    response=$(curl -s \
-        -u "$BRIDGE_USER:$pw" \
-        -H "OCS-APIREQUEST: true" \
-        "$NC_URL/ocs/v2.php/apps/spreed/api/v1/chat/$TALK_TOKEN?lookIntoFuture=0&limit=10&format=json")
-    msg_id=$(echo "$response" | python3 -c "
-import sys, json
-try:
-    for msg in json.load(sys.stdin).get('ocs',{}).get('data',[]):
-        if msg.get('actorId') == 'bridge-bot' and 'matterbridge-media' in msg.get('message',''):
-            print(msg['id']); break
-except: pass
-" 2>/dev/null)
-    [ -n "$msg_id" ] && curl -s -X DELETE \
-        -u "$BRIDGE_USER:$pw" -H "OCS-APIREQUEST: true" \
-        "$NC_URL/ocs/v2.php/apps/spreed/api/v1/chat/$TALK_TOKEN/$msg_id" -o /dev/null
-}
-
-upload_and_share() {
-    local filepath="$1"
-    local filename; filename=$(basename "$filepath")
-    local pw; pw=$(get_password)
-    [ -z "$pw" ] && return 1
-    [ ! -s "$filepath" ] && return 1
-
-    curl -s -X MKCOL -u "$BRIDGE_USER:$pw" \
-        "$NC_URL/remote.php/dav/files/$BRIDGE_USER/$NC_FOLDER/" -o /dev/null
-
-    local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        -T "$filepath" -u "$BRIDGE_USER:$pw" \
-        "$NC_URL/remote.php/dav/files/$BRIDGE_USER/$NC_FOLDER/$filename")
-
-    if [ "$http_code" = "201" ] || [ "$http_code" = "204" ]; then
-        sleep 2
-        delete_url_message "$pw"
-
-        local sender; sender=$(get_sender_name)
-        [ -n "$sender" ] && curl -s -X POST \
-            -u "$BRIDGE_USER:$pw" -H "OCS-APIREQUEST: true" \
-            "$NC_URL/ocs/v2.php/apps/spreed/api/v1/chat/$TALK_TOKEN" \
-            --data-urlencode "message=📷 $sender (Telegram):" -o /dev/null
-
-        curl -s -X POST \
-            -u "$BRIDGE_USER:$pw" -H "OCS-APIREQUEST: true" \
-            "$NC_URL/ocs/v2.php/apps/files_sharing/api/v1/shares" \
-            -d "path=/$NC_FOLDER/$filename&shareType=10&shareWith=$TALK_TOKEN" -o /dev/null
-    fi
-}
-
-# Matterbridge creates a new subdir per file — watch parent for CREATE events,
-# then poll up to 5s for the file (avoids inotifywait race condition)
-inotifywait -m -e create "$MEDIA_DIR" --format '%w%f' 2>/dev/null \
-| while read -r dirpath; do
-    [ ! -d "$dirpath" ] && continue
-    (
-        for i in $(seq 1 5); do
-            filepath=$(find "$dirpath" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | head -1)
-            if [ -n "$filepath" ]; then
-                upload_and_share "$filepath"; break
-            fi
-            sleep 1
-        done
-    ) &
-done
-```
-
-`/etc/systemd/system/mb-media-to-talk.service`:
-
-```ini
-[Unit]
-Description=Matterbridge media relay to Nextcloud Talk
-After=network.target nc-video-watcher.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/mb-media-to-talk
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
+cp scripts/mb-media-to-talk /usr/local/bin/mb-media-to-talk
 chmod +x /usr/local/bin/mb-media-to-talk
+cp systemd/mb-media-to-talk.service /etc/systemd/system/mb-media-to-talk.service
 systemctl daemon-reload
 systemctl enable --now mb-media-to-talk
 ```
 
 ---
 
-## 11. NGINX Proxy Manager (NPM) Settings
+## 10. NGINX Proxy Manager Settings
 
 In NPM's Advanced tab for the Nextcloud proxy host, add:
 
@@ -711,9 +505,9 @@ These settings fix video streaming buffering and range request handling.
 
 ---
 
-## 12. coturn TURN Server
+## 11. coturn TURN Server
 
-Required for Talk video/audio calls through NAT (cellular, strict home ISPs).
+Required for Talk video/audio calls through NAT (cellular, strict home ISPs). Can run on the same host or a separate one.
 
 ```bash
 apt-get install -y coturn
@@ -725,14 +519,14 @@ apt-get install -y coturn
 listening-port=3478
 tls-listening-port=5349
 listening-ip=0.0.0.0
-cert=/etc/letsencrypt/live/turn.your.domain.com/fullchain.pem
-pkey=/etc/letsencrypt/live/turn.your.domain.com/privkey.pem
+cert=/etc/letsencrypt/live/YOUR_TURN_DOMAIN/fullchain.pem
+pkey=/etc/letsencrypt/live/YOUR_TURN_DOMAIN/privkey.pem
 relay-ip=YOUR_LAN_IP
 external-ip=YOUR_PUBLIC_IP/YOUR_LAN_IP
 min-port=49152
 max-port=65535
-realm=turn.your.domain.com
-server-name=turn.your.domain.com
+realm=YOUR_TURN_DOMAIN
+server-name=YOUR_TURN_DOMAIN
 use-auth-secret
 static-auth-secret=YOUR_TURN_SECRET
 no-multicast-peers
@@ -745,31 +539,22 @@ log-file=/var/log/turnserver.log
 simple-log
 ```
 
-> **Port range:** `49152–65535` — each call uses ~4 ports. The range `49152–49162` (10 ports) only handles ~2 concurrent calls. Forward the full range TCP+UDP on your router.
+> **Port range:** `49152–65535` gives headroom for many concurrent calls. Each WebRTC call uses ~4 ports. Forward the full range TCP+UDP on your router/firewall.
 
-Register in Nextcloud Talk admin panel (Settings → Talk → TURN servers) or via occ:
+Register in Nextcloud Talk admin panel: Settings → Talk → TURN servers → add `turns:YOUR_TURN_DOMAIN:5349` with your secret.
 
 ```bash
-# Generate a random secret
+# Generate secret
 openssl rand -hex 32
 
-# Add TURN server in Talk admin UI or directly via DB
-# Talk admin: Settings → Talk → TURN servers → add turns:turn.your.domain.com:5349
-```
-
-```bash
 systemctl enable --now coturn
 ```
 
 ---
 
-## 13. Fail2ban
+## 12. Fail2ban
 
-Protects against brute-force login attempts on Nextcloud and SSH.
-
-```bash
-apt-get install -y fail2ban
-```
+Protects against brute-force login attempts on Nextcloud, Apache, and SSH.
 
 `/etc/fail2ban/filter.d/nextcloud.conf` (see `fail2ban/filter.d/nextcloud.conf`):
 
@@ -825,67 +610,65 @@ bantime  = 1h
 ```bash
 systemctl enable --now fail2ban
 
-# Verify all 4 jails loaded
+# Verify all jails loaded
 fail2ban-client status
 
-# Test filter against your log
-fail2ban-regex /var/ncdata/nextcloud.log /etc/fail2ban/filter.d/nextcloud.conf
+# Whitelist your own IP to avoid locking yourself out
+# Add to /etc/fail2ban/jail.d/nextcloud.conf under [DEFAULT]:
+# ignoreip = 127.0.0.1/8 ::1 YOUR.HOME.IP
+
+# Unban an IP manually
+fail2ban-client set nextcloud unbanip 1.2.3.4
 ```
 
 ---
 
-## 14. Archive Bot (Talk)
+## 13. Archive Bot (Talk)
 
 A Nextcloud Talk bot that intercepts paywalled links, fetches the archive.ph snapshot (or Wayback Machine fallback), posts the direct archive URL as a threaded reply, and deletes the original message.
 
-Works for links posted from both Talk and Telegram (via the bridge).
+Works in any Talk room it's enabled in, including rooms with the Telegram bridge — links posted from Telegram are caught too.
 
 ### Prerequisites
 
 ```bash
-# Generate bot secret and admin app password
-openssl rand -hex 32   # use as BOT_SECRET below
+# Generate bot HMAC secret
+openssl rand -hex 32   # → YOUR_BOT_SECRET
 
-# Generate admin app password (needed to delete messages as moderator)
+# Generate admin app password (needed to delete messages)
 su -s /bin/bash www-data -c \
   "php8.4 /home/nextcloud/occ user:auth-tokens:add --name 'archive-bot-delete' admin"
+# → YOUR_ADMIN_APP_PASS
 ```
 
 ### Bot Script
 
-See `scripts/archive-bot`. Update these variables at the top:
+See `scripts/archive-bot`. Update these values at the top:
 
 | Variable | Description |
 |---|---|
-| `SECRET` | 32-byte hex secret generated above |
-| `NC_URL` | Your Nextcloud URL |
-| `NC_ADMIN_PASS` | App password generated above |
+| `SECRET` | `YOUR_BOT_SECRET` as bytes |
+| `NC_URL` | `YOUR_NC_URL` |
+| `NC_ADMIN_PASS` | `YOUR_ADMIN_APP_PASS` |
 
 ```bash
 cp scripts/archive-bot /usr/local/bin/archive-bot
 chmod +x /usr/local/bin/archive-bot
+cp systemd/archive-bot.service /etc/systemd/system/archive-bot.service
+systemctl daemon-reload
+systemctl enable --now archive-bot
 ```
 
-### Add Admin to Rooms (required for message deletion)
+### Add Admin to Rooms
 
-Admin must be a moderator in every room where the bot is active:
+Admin must be a moderator in every room where the bot is active so it can delete messages:
 
 ```bash
 OCC="su -s /bin/bash www-data -c 'php8.4 /home/nextcloud/occ'"
 
-# Add and promote admin in each room (repeat per room token)
-$OCC talk:room:add --user admin ROOM_TOKEN
-$OCC talk:room:promote ROOM_TOKEN admin
-```
-
-### Systemd Service
-
-See `systemd/archive-bot.service`:
-
-```bash
-cp systemd/archive-bot.service /etc/systemd/system/archive-bot.service
-systemctl daemon-reload
-systemctl enable --now archive-bot
+# Repeat for each room token
+$OCC talk:room:add --user admin YOUR_TALK_TOKEN
+$OCC talk:room:promote YOUR_TALK_TOKEN admin
 ```
 
 ### Register and Enable Bot
@@ -894,53 +677,69 @@ systemctl enable --now archive-bot
 # Register system-wide (run once)
 php8.4 /home/nextcloud/occ talk:bot:install \
   "archive-bot" \
-  "BOT_SECRET" \
+  "YOUR_BOT_SECRET" \
   "http://127.0.0.1:9876" \
   "Replies with archive.ph links for paywalled URLs"
 
-# Check assigned ID
+# Get the assigned bot ID
 php8.4 /home/nextcloud/occ talk:bot:list
 
 # Enable in each room (repeat per room token)
-php8.4 /home/nextcloud/occ talk:bot:setup BOT_ID ROOM_TOKEN
+php8.4 /home/nextcloud/occ talk:bot:setup BOT_ID YOUR_TALK_TOKEN
 ```
 
 ### How It Works
 
-1. Talk sends a webhook to `http://127.0.0.1:9876` for every message
+1. Talk sends a signed webhook to `http://127.0.0.1:9876` for every message
 2. Bot verifies HMAC-SHA256 signature using the shared secret
-3. Extracts URLs and checks domain against paywall list
+3. Extracts URLs and checks domain against the paywall list (edit `PAYWALL_DOMAINS` in the script)
 4. Strips tracking query parameters (`utm_*`, `srnd`, `fbclid`, etc.) before archive lookup
 5. Tries `archive.ph/newest/{url}` — returns direct timestamped URL if found
 6. Falls back to Wayback Machine availability check
 7. Posts archive URL as a threaded reply using the bot API
 8. Deletes the original message using admin credentials
 
-### Adding Paywall Domains
+---
 
-Edit the `PAYWALL_DOMAINS` set in `/usr/local/bin/archive-bot` and restart:
+## 14. Two-Factor Authentication (TOTP)
 
 ```bash
-systemctl restart archive-bot
+su -s /bin/bash www-data -c "php8.4 /home/nextcloud/occ app:enable twofactor_totp"
+su -s /bin/bash www-data -c "php8.4 /home/nextcloud/occ app:enable twofactor_backupcodes"
+```
+
+Users enable it themselves: Profile → Settings → Security → Two-Factor Authentication → TOTP.
+
+To **enforce** 2FA for all users:
+
+```bash
+su -s /bin/bash www-data -c "php8.4 /home/nextcloud/occ twofactorauth:enforce --on"
+```
+
+To disable 2FA for a locked-out user:
+
+```bash
+su -s /bin/bash www-data -c "php8.4 /home/nextcloud/occ twofactorauth:disable USERNAME totp"
 ```
 
 ---
 
 ## 15. Post-Install Checklist
 
-- [ ] Test video upload in Talk — confirm auto-transcode triggers for files > 10 Mbps
 - [ ] Test SMTP — Admin → Basic Settings → Send test email
 - [ ] Connect Last.fm — Music → Settings → Connect (each user does this individually)
 - [ ] Test Telegram bridge — send a message both ways
 - [ ] Send a photo from Telegram — confirm it appears as inline image in Talk
 - [ ] Share a photo in Talk — confirm it appears in Telegram
 - [ ] Verify SMB music mount is read-only (`files_external:verify 1`)
-- [ ] Post a paywalled link — confirm archive-bot replies with direct archive URL and deletes original
+- [ ] Post a paywalled link — confirm archive-bot replies with a direct archive URL and deletes the original
 - [ ] Verify fail2ban jails are active: `fail2ban-client status`
-- [ ] Confirm all services are running
+- [ ] Test a Talk video call — confirm TURN server is used for NAT traversal
+- [ ] Enable TOTP for admin account before sharing server with users
+- [ ] Confirm all services are running:
 
 ```bash
-systemctl status nc-video-watcher mb-media-to-talk archive-bot fail2ban coturn
+systemctl status mb-media-to-talk archive-bot fail2ban coturn
 ```
 
 ---
@@ -952,17 +751,15 @@ systemctl status nc-video-watcher mb-media-to-talk archive-bot fail2ban coturn
 | `/home/nextcloud/config/config.php` | Nextcloud config (edit via occ only) |
 | `/etc/apache2/sites-available/nextcloud.conf` | Apache vhost |
 | `/etc/cron.d/nextcloud-maintenance` | Scheduled maintenance |
-| `/usr/local/bin/nc-transcode-video` | Hardware transcode script |
-| `/usr/local/bin/nc-video-watcher` | Talk video upload watcher |
 | `/usr/local/bin/mb-media-to-talk` | Telegram media relay |
 | `/usr/local/bin/archive-bot` | Paywalled link archive bot |
 | `/var/matterbridge-media/` | Temp media storage for bridge |
 | `/var/ncdata/` | Nextcloud data directory |
-| `/tmp/bridge-ROOM_TOKEN.toml` | Active Matterbridge config (auto-generated) |
-| `/tmp/bridge-ROOM_TOKEN.log` | Matterbridge live log |
-| `/home/nextcloud/apps/spreed/lib/MatterbridgeManager.php` | Patched for native message formatting |
-| `/var/log/apache2/nextcloud_access.log` | Apache access log (used by relay service) |
 | `/var/ncdata/nextcloud.log` | Nextcloud application log (used by fail2ban) |
+| `/tmp/bridge-YOUR_TALK_TOKEN.toml` | Active Matterbridge config (auto-generated, rotates on restart) |
+| `/tmp/bridge-YOUR_TALK_TOKEN.log` | Matterbridge live log |
+| `/home/nextcloud/apps/spreed/lib/MatterbridgeManager.php` | Patched for native message formatting — re-patch after Talk updates |
+| `/var/log/apache2/nextcloud_access.log` | Apache access log |
 | `/etc/fail2ban/filter.d/nextcloud.conf` | Fail2ban filter for Nextcloud login failures |
 | `/etc/fail2ban/jail.d/nextcloud.conf` | Fail2ban jails (Nextcloud, Apache, SSH) |
 | `/etc/turnserver.conf` | coturn TURN server config |

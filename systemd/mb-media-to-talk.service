@@ -1,6 +1,6 @@
 [Unit]
 Description=Matterbridge media relay to Nextcloud Talk
-After=network.target nc-video-watcher.service
+After=network.target
 
 [Service]
 Type=simple
