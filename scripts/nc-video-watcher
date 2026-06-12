@@ -1,0 +1,25 @@
+#!/bin/bash
+# Watches each user's Talk directory for new video uploads and triggers
+# hardware transcoding on the remote transcode host.
+# High-bitrate files (> 10 Mbps) are transcoded to H.264 with faststart.
+# Low-bitrate files are faststart-remuxed in-place (zero re-encode).
+
+DATA_DIR=YOUR_NC_DATA_DIR
+USERS=(YOUR_USERS)
+VIDEO_EXTS="mp4|mkv|avi|mov|wmv|webm|flv|m4v"
+
+WATCH_PATHS=()
+for u in "${USERS[@]}"; do
+    dir="$DATA_DIR/$u/files/Talk"
+    mkdir -p "$dir"
+    chown www-data:www-data "$dir"
+    WATCH_PATHS+=("$dir")
+done
+
+inotifywait -m -e close_write --format '%w%f' "${WATCH_PATHS[@]}" 2>/dev/null \
+| while read -r filepath; do
+    if echo "$filepath" | grep -qiE "\.($VIDEO_EXTS)$"; then
+        nc_user=$(echo "$filepath" | sed "s|$DATA_DIR/||;s|/.*||")
+        /usr/local/bin/nc-transcode-video "$filepath" "$nc_user" &
+    fi
+done

@@ -4,10 +4,10 @@
 
 TARGET_FILE="MatterbridgeManager.php"
 TARGET_DIR="/home/nextcloud/apps/spreed/lib"
-NC_URL="https://next.minitrash.com"
-DM_TOKEN="eiisscuv"
+NC_URL="YOUR_NC_URL"
+DM_TOKEN="YOUR_ADMIN_DM_TOKEN"
 NC_USER="admin"
-NC_PASS="cyPVBoLNCSjZppl5rIdaF0crbYug0WLBaiVvzKcdCUTbuvzjF7YdXrIKCxqbs8PYe0ZnwvQc"
+NC_PASS="YOUR_ADMIN_APP_PASS"
 
 dm() {
     curl -s -X POST \

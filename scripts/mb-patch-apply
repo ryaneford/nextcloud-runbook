@@ -37,7 +37,7 @@ def apply():
     P1_INSERT = (
         '\t\t$content = \'[general]\' . "\\n";\n'
         '\t\t$content .= \'\tMediaDownloadPath = "/var/matterbridge-media"\' . "\\n";\n'
-        '\t\t$content .= \'\tMediaServerDownload = "https://next.minitrash.com/matterbridge-media"\' . "\\n";\n'
+        '\t\t$content .= \'\tMediaServerDownload = "YOUR_NC_URL/matterbridge-media"\' . "\\n";\n'
         '\t\t$content .= \'\tMediaDownloadSize = 52428800\' . "\\n\\n"; // 50 MB\n'
         "\t\tforeach ($bridge['parts'] as $k => $part) {"
     )

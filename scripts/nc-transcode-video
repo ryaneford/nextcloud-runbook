@@ -1,0 +1,67 @@
+#!/bin/bash
+# Hardware-accelerated video transcoding via a remote host with Intel VA-API.
+# Files > 10 Mbps are transcoded to H.264 AAC with faststart.
+# Files <= 10 Mbps are skipped (faststart-remuxed by nc-video-watcher if needed).
+# Usage: nc-transcode-video <filepath> <nextcloud-user>
+
+FILE="$1"
+NC_USER="$2"
+TRANSCODE_HOST="YOUR_TRANSCODE_HOST"
+SSH_KEY="/root/.ssh/id_ed25519_transcode"
+REMOTE_SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$TRANSCODE_HOST"
+REMOTE_SCP="scp -i $SSH_KEY -o StrictHostKeyChecking=no"
+TMPDIR_REMOTE="/tmp/nc-transcode"
+OCC=/home/nextcloud/occ
+AUDIO_BITRATE=128k
+
+# Wait for upload to finish — poll until file size stabilises
+prev=0
+for i in $(seq 1 30); do
+    cur=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+    [ "$cur" -eq "$prev" ] && [ "$cur" -gt 0 ] && break
+    prev=$cur
+    sleep 3
+done
+
+[ ! -s "$FILE" ] && exit 0
+
+# Check bitrate — skip if already <= 10 Mbps
+bitrate=$(ffprobe -v quiet -print_format json -show_format "$FILE" 2>/dev/null \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print(int(d['format'].get('bit_rate',0)))" 2>/dev/null)
+[ -z "$bitrate" ] || [ "$bitrate" -le 10000000 ] && exit 0
+
+BASENAME=$(basename "$FILE")
+REMOTE_IN="$TMPDIR_REMOTE/$BASENAME"
+REMOTE_OUT="$TMPDIR_REMOTE/out_$BASENAME"
+
+$REMOTE_SSH "mkdir -p $TMPDIR_REMOTE" || exit 1
+$REMOTE_SCP "$FILE" "root@$TRANSCODE_HOST:$REMOTE_IN" || exit 1
+
+# Intel iHD (6th gen+) only supports CQP mode — QP 38 ≈ 8-10 Mbps output
+# -movflags +faststart moves moov atom to front for instant browser playback
+$REMOTE_SSH "ffmpeg -y \
+  -vaapi_device /dev/dri/renderD128 \
+  -i '$REMOTE_IN' \
+  -vf 'format=nv12,hwupload' \
+  -c:v h264_vaapi -qp 38 \
+  -c:a aac -b:a $AUDIO_BITRATE \
+  -movflags +faststart -map_metadata 0 \
+  '$REMOTE_OUT' 2>/dev/null"
+
+if [ $? -ne 0 ]; then
+    $REMOTE_SSH "rm -f '$REMOTE_IN' '$REMOTE_OUT'"
+    exit 1
+fi
+
+TMPLOCAL="${FILE%.mp4}_new.mp4"
+$REMOTE_SCP "root@$TRANSCODE_HOST:$REMOTE_OUT" "$TMPLOCAL"
+
+if [ $? -eq 0 ] && [ -s "$TMPLOCAL" ]; then
+    chown www-data:www-data "$TMPLOCAL"
+    mv "$TMPLOCAL" "$FILE"
+    chown www-data:www-data "$FILE"
+    su -s /bin/sh www-data -c "php $OCC files:scan --path='/$NC_USER/files' -q" 2>/dev/null
+fi
+
+$REMOTE_SSH "rm -f '$REMOTE_IN' '$REMOTE_OUT'"
+rm -f "$TMPLOCAL"

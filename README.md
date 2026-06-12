@@ -37,7 +37,11 @@ Replace these placeholders throughout this guide before running any commands.
 | `YOUR_SMTP_PASSWORD` | SMTP password or app token | — |
 | `YOUR_SMTP_FROM` | From address | `noreply@example.com` |
 | `YOUR_BOT_SECRET` | Archive bot HMAC secret (`openssl rand -hex 32`) | — |
-| `YOUR_ADMIN_APP_PASS` | Admin app password for archive bot message deletion | — |
+| `YOUR_ADMIN_APP_PASS` | Admin app password for archive bot and patch watcher | — |
+| `YOUR_ADMIN_DM_TOKEN` | Talk token for the admin DM room (patch watcher notifications) | `abc12xyz` |
+| `YOUR_NC_DATA_DIR` | Nextcloud data directory on disk | `/home/ncdata` |
+| `YOUR_TRANSCODE_HOST` | IP of the hardware transcoding host (Intel VA-API) | `192.168.1.10` |
+| `YOUR_USERS` | Space-separated list of NC usernames for the video watcher | `ryan mike jimm dave` |
 
 ---
 
@@ -719,7 +723,88 @@ php8.4 /home/nextcloud/occ talk:bot:setup BOT_ID YOUR_TALK_TOKEN
 
 ---
 
-## 14. Two-Factor Authentication (TOTP)
+## 14. Hardware Video Transcoding (Optional)
+
+Watches each user's Talk folder for newly uploaded videos. Files above 10 Mbps are offloaded to a remote host with Intel VA-API and transcoded to H.264 with `-movflags +faststart`, then written back in-place. Files under 10 Mbps are left as-is (already within streaming limits).
+
+> **Why faststart matters:** MP4 files recorded on Android phones store the movie index (`moov` atom) at the **end** of the file. Browsers must download 100% of the file before playback can start. ffmpeg's `-movflags +faststart` moves `moov` to the front — videos begin playing immediately.
+
+### Prerequisites
+
+```bash
+# Generate an SSH key for the transcode host (run once on Nextcloud VM)
+ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519_transcode -N "" -C "nextcloud-transcode"
+ssh-copy-id -i /root/.ssh/id_ed25519_transcode root@YOUR_TRANSCODE_HOST
+
+# Install VA-API driver on the transcode host (Intel 6th gen+)
+apt-get install -y intel-media-va-driver vainfo ffmpeg
+# Verify: vainfo --display drm --device /dev/dri/renderD128
+```
+
+### Deploy
+
+```bash
+cp scripts/nc-transcode-video /usr/local/bin/nc-transcode-video
+cp scripts/nc-video-watcher /usr/local/bin/nc-video-watcher
+cp systemd/nc-video-watcher.service /etc/systemd/system/nc-video-watcher.service
+chmod +x /usr/local/bin/nc-transcode-video /usr/local/bin/nc-video-watcher
+```
+
+Update these values in both scripts before deploying:
+
+| Variable | Script | Value |
+|---|---|---|
+| `YOUR_NC_DATA_DIR` | nc-video-watcher | Nextcloud data path (e.g. `/home/ncdata`) |
+| `YOUR_USERS` | nc-video-watcher | Space-separated NC usernames |
+| `YOUR_TRANSCODE_HOST` | nc-transcode-video | IP of the VA-API host |
+
+```bash
+systemctl daemon-reload
+systemctl enable --now nc-video-watcher
+```
+
+### Fix Existing Files (moov-at-end)
+
+To fix already-uploaded MP4s that won't play immediately in browsers:
+
+```bash
+# Remux a single file (zero quality loss — no re-encode)
+ffmpeg -y -i /path/to/file.mp4 -movflags faststart -c:v copy -c:a copy -f mp4 /path/to/file.mp4.tmp \
+  && mv /path/to/file.mp4.tmp /path/to/file.mp4
+
+# After remuxing, update Nextcloud's filecache
+su -s /bin/sh www-data -c "php /home/nextcloud/occ files:scan --path='/USERNAME/files/Talk' --shallow"
+```
+
+To check all Talk-folder MP4s at once:
+
+```bash
+python3 << 'EOF'
+import struct, os, glob
+for path in glob.glob('/home/ncdata/*/files/Talk/*.mp4'):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2); size = f.tell(); f.seek(0)
+            pos = 0; moov = None; mdat = None
+            for _ in range(20):
+                f.seek(pos); h = f.read(8)
+                if len(h) < 8: break
+                asz = struct.unpack('>I', h[:4])[0]; atyp = h[4:8].decode('ascii', errors='?')
+                if atyp == 'moov': moov = pos
+                if atyp == 'mdat': mdat = pos
+                if asz == 1: f.seek(pos+8); asz = struct.unpack('>Q', f.read(8))[0]
+                if asz < 8: break
+                pos += asz
+        status = 'OK' if (moov and mdat and moov < mdat) else 'BAD(moov-at-end)'
+        print(f'{status:20s} {size/1024/1024:7.1f}MB  {path}')
+    except Exception as e:
+        print(f'ERROR: {path}: {e}')
+EOF
+```
+
+---
+
+## 15. Two-Factor Authentication (TOTP)
 
 ```bash
 su -s /bin/bash www-data -c "php8.4 /home/nextcloud/occ app:enable twofactor_totp"
@@ -742,7 +827,7 @@ su -s /bin/bash www-data -c "php8.4 /home/nextcloud/occ twofactorauth:disable US
 
 ---
 
-## 15. Post-Install Checklist
+## 16. Post-Install Checklist
 
 - [ ] Test SMTP — Admin → Basic Settings → Send test email
 - [ ] Connect Last.fm — Music → Settings → Connect (each user does this individually)
@@ -754,10 +839,12 @@ su -s /bin/bash www-data -c "php8.4 /home/nextcloud/occ twofactorauth:disable US
 - [ ] Verify fail2ban jails are active: `fail2ban-client status`
 - [ ] Test a Talk video call — confirm TURN server is used for NAT traversal
 - [ ] Enable TOTP for admin account before sharing server with users
+- [ ] If hardware transcoding is deployed: upload a high-bitrate video in Talk and confirm it gets transcoded automatically
+- [ ] Run the moov-atom checker (Section 14) against existing files and remux any BAD ones
 - [ ] Confirm all services are running:
 
 ```bash
-systemctl status mb-media-to-talk archive-bot fail2ban coturn
+systemctl status mb-media-to-talk archive-bot fail2ban coturn nc-video-watcher
 ```
 
 ---
@@ -781,3 +868,6 @@ systemctl status mb-media-to-talk archive-bot fail2ban coturn
 | `/etc/fail2ban/filter.d/nextcloud.conf` | Fail2ban filter for Nextcloud login failures |
 | `/etc/fail2ban/jail.d/nextcloud.conf` | Fail2ban jails (Nextcloud, Apache, SSH) |
 | `/etc/turnserver.conf` | coturn TURN server config |
+| `/usr/local/bin/nc-video-watcher` | Talk video upload watcher (triggers transcoding) |
+| `/usr/local/bin/nc-transcode-video` | Hardware transcode script (VA-API, copies to/from transcode host) |
+| `/root/.ssh/id_ed25519_transcode` | SSH key for transcode host |

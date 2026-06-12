@@ -5,9 +5,9 @@
 
 MEDIA_DIR=/var/matterbridge-media
 BRIDGE_USER="bridge-bot"
-TOML="/tmp/bridge-h8frj3zy.toml"
-NC_URL="https://next.minitrash.com"
-TALK_TOKEN="h8frj3zy"
+TOML="/tmp/bridge-YOUR_TALK_TOKEN.toml"
+NC_URL="YOUR_NC_URL"
+TALK_TOKEN="YOUR_TALK_TOKEN"
 NC_FOLDER="TelegramMedia"
 
 get_password() {

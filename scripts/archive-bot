@@ -12,10 +12,10 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler
 from socketserver import ThreadingTCPServer
 
-SECRET = b"74d9fdfe6b22a47b6d05f327303797a3207dad71b1982f227a23e1fecef32d36"
-NC_URL = "https://next.minitrash.com"
+SECRET = b"YOUR_BOT_SECRET"
+NC_URL = "YOUR_NC_URL"
 NC_ADMIN_USER = "admin"
-NC_ADMIN_PASS = "cyPVBoLNCSjZppl5rIdaF0crbYug0WLBaiVvzKcdCUTbuvzjF7YdXrIKCxqbs8PYe0ZnwvQc"
+NC_ADMIN_PASS = "YOUR_ADMIN_APP_PASS"
 PORT = 9876
 
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0"

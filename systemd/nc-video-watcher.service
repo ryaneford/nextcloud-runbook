@@ -1,0 +1,12 @@
+[Unit]
+Description=Nextcloud Talk video transcoder watcher
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nc-video-watcher
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
